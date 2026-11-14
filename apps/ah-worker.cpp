@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
     v.id = ValidationRunId{bootRaw}; v.accelerator = devId; v.timestamp = now;
     v.profile = ValidationProfile::FULL; v.depth = ValidationDepth::FULL; v.passed = true; v.maxError = 0.0f;
     v.worker = worker; v.workerBootId = boot; v.validationGeneration = ValidationGeneration{1};
+    v.deviceGeneration = DeviceGeneration{devicegen};
     wire::Writer vb = msg::valBody(env, v);
     bool vac = sendAndExpect(c, proto::MessageType::VALIDATION_RESULT, vb, &rt, &m);
     if (mode != "live") std::printf("RESULT VALIDATION accept=%d msg=%s\n", vac ? 1 : 0, m.c_str());

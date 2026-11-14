@@ -72,6 +72,9 @@ bool readAssessment(wire::Reader& r, HealthAssessment& a) noexcept {
 }  // namespace
 
 std::vector<std::uint8_t> encodeStateInternal(const HealthStore& store) {
+  // Snapshots and saves run on coordinator connection threads while others
+  // update the store: read it under its lock so the encoding is consistent.
+  std::shared_lock lock(store.mu_);
   wire::Writer body;
   store.policy_.write(body);
   body.u64(store.policyGeneration_.get());
@@ -112,6 +115,11 @@ std::vector<std::uint8_t> encodeStateInternal(const HealthStore& store) {
     body.u8(d.inRecovery ? 1 : 0);
     body.u8(d.present ? 1 : 0);
   }
+  // Schema 2: worker incarnation history.
+  body.u32(static_cast<std::uint32_t>(store.workerLatestBoot_.size()));
+  for (const auto& [w, b] : store.workerLatestBoot_) { w.write(body); b.write(body); }
+  body.u32(static_cast<std::uint32_t>(store.retiredBoots_.size()));
+  for (const auto& [w, b] : store.retiredBoots_) { body.u64(w); body.u64(b); }
 
   wire::Writer frame;
   frame.bytes(kMagicP, 4);
@@ -130,7 +138,10 @@ bool decodeStateInternal(const std::vector<std::uint8_t>& data, HealthStore& out
   if (data.size() < 4 + 4 + 4 + 4) { if (error) *error = "file too short"; return false; }
   if (std::memcmp(data.data(), kMagicP, 4) != 0) { if (error) *error = "bad magic"; return false; }
   std::uint32_t version = util::load_le32(data.data() + 4);
-  if (version != kPersistenceSchemaVersion) { if (error) *error = "unsupported schema version"; return false; }
+  if (version < kPersistenceMinSchemaVersion || version > kPersistenceSchemaVersion) {
+    if (error) *error = "unsupported schema version";
+    return false;
+  }
   std::uint32_t payloadLen = util::load_le32(data.data() + 8);
   const std::size_t bodyLen = 4 + 4 + 4 + static_cast<std::size_t>(payloadLen);
   if (data.size() != bodyLen + 4) { if (error) *error = "truncated or trailing garbage"; return false; }
@@ -145,21 +156,11 @@ bool decodeStateInternal(const std::vector<std::uint8_t>& data, HealthStore& out
   const std::uint64_t epoch = r.u64();
   if (!r.ok() || policyGen.is_null()) { if (error) *error = "invalid policy generation"; return false; }
 
-  out.policy_ = pol;
-  out.policyGeneration_ = policyGen;
-  out.coordinatorEpoch_ = epoch;
-  out.devices_.clear();
-  out.uuidIndex_.clear();
-  out.stateIndex_.clear();
-  out.readinessIndex_.clear();
-  out.faultIndex_.clear();
-  out.quarantineIndex_.clear();
-  out.staleIndex_.clear();
-  out.globalFaults_.clear();
-  out.globalChanges_.clear();
-
+  // Everything is decoded into locals first; `out` changes only once the whole
+  // state has been accepted, so a rejected load leaves it untouched.
   const std::uint32_t deviceCount = r.u32();
   if (r.fail() || deviceCount > util::kMaxCount) { if (error) *error = "invalid device count"; return false; }
+  std::map<AcceleratorId, HealthStore::Device> devices;
   std::map<DeviceUuid, AcceleratorId> seenUuid;
   std::uint64_t maxDeviceRaw = 0;
   for (std::uint32_t i = 0; i < deviceCount; ++i) {
@@ -170,6 +171,7 @@ bool decodeStateInternal(const std::vector<std::uint8_t>& data, HealthStore& out
     d.lastWorker = WorkerId::read(r);
     d.lastWorkerBootId = WorkerBootId::read(r);
     d.generation = DeviceGeneration::read(r);
+    if (d.generation.is_null()) { if (error) *error = "invalid device generation"; return false; }
     if (!read(r, d.state)) { if (error) *error = "invalid health state"; return false; }
     if (!read(r, d.readiness)) { if (error) *error = "invalid readiness"; return false; }
     d.healthGeneration = HealthGeneration(r.u64());
@@ -241,14 +243,44 @@ bool decodeStateInternal(const std::vector<std::uint8_t>& data, HealthStore& out
       if (error) *error = "impossible state: active quarantine with HEALTHY"; return false;
     }
     if (seenUuid.count(d.uuid)) { if (error) *error = "duplicate device uuid"; return false; }
+    if (devices.count(d.id)) { if (error) *error = "duplicate device id"; return false; }
     seenUuid[d.uuid] = d.id;
     maxDeviceRaw = std::max(maxDeviceRaw, d.id.get());
-    out.devices_[d.id] = std::move(d);
-    out.uuidIndex_[out.devices_[d.id].uuid] = out.devices_[d.id].id;
+    const AcceleratorId deviceId = d.id;
+    devices.emplace(deviceId, std::move(d));
+  }
+
+  std::map<WorkerId, WorkerBootId> latestBoot;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> retiredBoots;
+  if (version >= 2) {
+    const std::uint32_t workerCount = r.u32();
+    if (r.fail() || workerCount > util::kMaxCount) { if (error) *error = "invalid worker count"; return false; }
+    for (std::uint32_t i = 0; i < workerCount; ++i) {
+      const WorkerId w = WorkerId::read(r);
+      const WorkerBootId b = WorkerBootId::read(r);
+      if (r.fail() || !latestBoot.emplace(w, b).second) { if (error) *error = "invalid worker boot history"; return false; }
+    }
+    const std::uint32_t retiredCount = r.u32();
+    if (r.fail() || retiredCount > util::kMaxCount) { if (error) *error = "invalid retired boot count"; return false; }
+    for (std::uint32_t i = 0; i < retiredCount; ++i) {
+      const std::uint64_t w = r.u64();
+      const std::uint64_t b = r.u64();
+      if (r.fail() || !retiredBoots.insert({w, b}).second) { if (error) *error = "invalid retired boot"; return false; }
+    }
   }
 
   if (r.remaining() != 0) { if (error) *error = "trailing bytes in payload"; return false; }
 
+  std::unique_lock lock(out.mu_);
+  out.policy_ = pol;
+  out.policyGeneration_ = policyGen;
+  out.coordinatorEpoch_ = epoch;
+  out.devices_ = std::move(devices);
+  out.uuidIndex_ = std::move(seenUuid);
+  out.globalFaults_.clear();
+  out.globalChanges_.clear();
+  out.workerLatestBoot_ = std::move(latestBoot);
+  out.retiredBoots_ = std::move(retiredBoots);
   out.nextDeviceRaw_ = maxDeviceRaw + 1;
   out.nextFaultRaw_ = out.nextDeviceRaw_;
   out.nextObservationRaw_ = out.nextDeviceRaw_;

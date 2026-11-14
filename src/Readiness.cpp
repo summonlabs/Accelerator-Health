@@ -41,14 +41,28 @@ ReadinessResult ReadinessEvaluator::evaluate(const ReadinessInput& in) const {
       r.reasons.push_back("device unhealthy; drain required");
       break;
     case HealthState::DEGRADED:
-      if (in.allowDegradedReadiness) {
-        r.state = ReadinessState::READY_DEGRADED;
-        r.executionReady = true;
-        r.reasons.push_back("degraded but policy permits degraded readiness");
-      } else {
+      // Degraded readiness passes the same validation, generation and recovery
+      // gates as healthy readiness; a degraded device is never more ready.
+      if (!in.allowDegradedReadiness) {
         r.state = ReadinessState::NOT_READY;
         r.executionReady = false;
         r.reasons.push_back("degraded and policy forbids degraded readiness");
+      } else if (in.validationDepth < in.requiredValidationDepth) {
+        r.state = ReadinessState::REVALIDATION_REQUIRED;
+        r.executionReady = false;
+        r.reasons.push_back("validation depth below required");
+      } else if (in.deviceGenerationChanged || in.policyGenerationChanged || in.runtimeCompatibilityChanged) {
+        r.state = ReadinessState::REVALIDATION_REQUIRED;
+        r.executionReady = false;
+        r.reasons.push_back("generation or compatibility changed");
+      } else if (in.requiresRevalidation) {
+        r.state = ReadinessState::REVALIDATION_REQUIRED;
+        r.executionReady = false;
+        r.reasons.push_back("revalidation required after recovery");
+      } else {
+        r.state = ReadinessState::READY_DEGRADED;
+        r.executionReady = true;
+        r.reasons.push_back("degraded but policy permits degraded readiness");
       }
       break;
     case HealthState::HEALTHY:

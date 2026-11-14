@@ -21,7 +21,9 @@ namespace ah {
 // Versioned, deterministic, integrity-checked binary persistence. Implemented in
 // Persistence.cpp. See that file for the schema; the public format is covered by
 // corruption/truncation/trailing-garbage rejection tests.
-inline constexpr std::uint32_t kPersistenceSchemaVersion = 1;
+// Schema 2 appends the worker incarnation history; schema 1 files still load.
+inline constexpr std::uint32_t kPersistenceSchemaVersion = 2;
+inline constexpr std::uint32_t kPersistenceMinSchemaVersion = 1;
 
 std::vector<std::uint8_t> encodeStateInternal(const HealthStore& store);
 bool decodeStateInternal(const std::vector<std::uint8_t>& data, HealthStore& out, std::string* error);

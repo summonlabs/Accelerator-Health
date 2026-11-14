@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -47,7 +48,17 @@ int main(int argc, char** argv) {
   HealthStore store(clock, pol, epoch);
   if (load && !stateFile.empty()) {
     std::string err;
-    if (!HealthStore::loadFromFile(stateFile, store, &err)) log("ERROR load: " + err);
+    if (HealthStore::loadFromFile(stateFile, store, &err)) {
+      // --epoch rolls the persisted epoch forward; it never moves it back.
+      if (epoch > store.coordinatorEpoch()) store.setCoordinatorEpoch(epoch);
+      epoch = store.coordinatorEpoch();
+    } else {
+      // State that exists but cannot be recovered must not be replaced by an
+      // empty store (and overwritten by its next save).
+      std::error_code ec;
+      if (std::filesystem::exists(stateFile, ec) || ec) { log("FATAL load: " + err); return 1; }
+      log("ERROR load: " + err);
+    }
   }
   net::TcpServer server;
   std::string err;
@@ -77,10 +88,17 @@ int main(int argc, char** argv) {
           case proto::MessageType::REGISTER: {
             msg::HelloBody hello;
             if (!msg::HelloBody::read(r, hello)) break;
+            if (!store.registerWorker(hello.worker, hello.boot)) {
+              // A superseded incarnation of this worker: refuse and bind nothing.
+              log("REFUSED worker=" + hello.worker.string() + " boot=" + hello.boot.string());
+              wire::Writer nack = msg::ackBody(proto::MessageType::REGISTER, false, "refused: superseded worker boot id");
+              proto::Frame out; out.type = proto::MessageType::ACK; out.payload = nack.data();
+              net::sendFrame(fd, out, &err2);
+              break;
+            }
             worker = hello.worker;
             boot = hello.boot;
             haveWorker = true;
-            store.registerWorker(worker, boot);
             std::vector<DeviceIdentity> devs;
             const auto n = r.u32();
             if (r.fail() || n > util::kMaxCount) break;
@@ -122,10 +140,10 @@ int main(int argc, char** argv) {
             if (!msg::readValBody(r, env, v)) break;
             bool dup = false;
             for (auto& d : store.allSnapshots()) (void)d;  // touch
-            store.recordValidation(v);
+            const std::string res = store.acceptValidation(v, env);
             auto snap = store.snapshot(v.accelerator);
-            log("EVENT VALIDATION device=" + v.accelerator.string() + " passed=" + (v.passed ? "1" : "0") + " state=" + to_string(snap.state) + " readiness=" + to_string(snap.readiness));
-            wire::Writer ack = msg::ackBody(proto::MessageType::VALIDATION_RESULT, true, "recorded");
+            log("EVENT VALIDATION device=" + v.accelerator.string() + " passed=" + (v.passed ? "1" : "0") + " " + res + " state=" + to_string(snap.state) + " readiness=" + to_string(snap.readiness));
+            wire::Writer ack = msg::ackBody(proto::MessageType::VALIDATION_RESULT, res == "accepted", res);
             proto::Frame out; out.type = proto::MessageType::ACK; out.payload = ack.data();
             net::sendFrame(fd, out, &err2);
             (void)dup;
@@ -135,9 +153,9 @@ int main(int argc, char** argv) {
             AuthorityEnvelope env;
             Fault f;
             if (!msg::readFaultBody(r, env, f)) break;
-            store.recordFault(f);
-            log("EVENT FAULT device=" + f.accelerator.string() + " " + to_string(f.type));
-            wire::Writer ack = msg::ackBody(proto::MessageType::FAULT_REPORT, true, "recorded");
+            const std::string res = store.acceptFault(f, env);
+            log("EVENT FAULT device=" + f.accelerator.string() + " " + to_string(f.type) + " " + res);
+            wire::Writer ack = msg::ackBody(proto::MessageType::FAULT_REPORT, res == "accepted", res);
             proto::Frame out; out.type = proto::MessageType::ACK; out.payload = ack.data();
             net::sendFrame(fd, out, &err2);
             break;

@@ -59,9 +59,19 @@ void HealthStore::setCoordinatorEpoch(std::uint64_t e) {
   coordinatorEpoch_ = e;
 }
 
-void HealthStore::registerWorker(WorkerId worker, WorkerBootId boot) {
+bool HealthStore::registerWorker(WorkerId worker, WorkerBootId boot) {
   std::unique_lock lock(mu_);
+  // A prior process incarnation must never regain authority once a restarted
+  // incarnation (a different boot id) has registered, even after the newer one
+  // disconnected or the coordinator restarted (the history is persisted).
+  if (retiredBoots_.count({worker.get(), boot.get()}) != 0) return false;
+  auto latest = workerLatestBoot_.find(worker);
+  if (latest != workerLatestBoot_.end() && latest->second != boot) {
+    retiredBoots_.insert({worker.get(), latest->second.get()});
+  }
+  workerLatestBoot_[worker] = boot;
   workerBootRegistry_[worker] = boot;
+  return true;
 }
 bool HealthStore::isWorkerCurrent(WorkerId worker, WorkerBootId boot) const {
   std::shared_lock lock(mu_);
@@ -77,7 +87,7 @@ void HealthStore::invalidateWorker(WorkerId worker, WorkerBootId boot, Timestamp
     for (auto& [id, d] : devices_) {
       if (d.lastWorker == worker && d.lastWorkerBootId == boot) {
         d.lastObservation = Timestamp{};  // strip freshness so readiness drops
-        d.deviceGenerationChangedFlag = false;
+        // A pending device-generation change still requires revalidation.
         reassessLocked(d);
         (void)id;
       }
@@ -148,8 +158,10 @@ std::string HealthStore::acceptObservation(const AcceleratorObservation& obs, co
     d.generation = env.deviceGeneration;
     d.deviceGenerationChangedFlag = true;
   }
-  d.lastWorker = obs.worker;
-  d.lastWorkerBootId = obs.workerBootId;
+  // Attribute the evidence to the fenced incarnation, so that incarnation's
+  // invalidation strips it (the body's own worker fields are not fenced).
+  d.lastWorker = env.workerId;
+  d.lastWorkerBootId = env.workerBootId;
   d.requiresRevalidation = false;
   for (const auto& dim : obs.dimensions) d.dimensions[dim.kind] = dim;
   d.lastObservation = obs.timestamp;
@@ -163,10 +175,26 @@ void HealthStore::recordFault(const Fault& fault) {
   auto it = devices_.find(fault.accelerator);
   if (it == devices_.end()) return;  // unknown device; do not fabricate evidence
   Device& d = it->second;
-  d.faults.record(fault);
-  faultIndex_[fault.type].insert(fault.accelerator);
-  globalFaults_.push_back(fault);
+  recordFaultLocked(d, fault);
   reassessLocked(d);
+}
+
+std::string HealthStore::acceptFault(const Fault& fault, const AuthorityEnvelope& env) {
+  std::unique_lock lock(mu_);
+  auto it = devices_.find(fault.accelerator);
+  if (it == devices_.end()) return "rejected: unknown device";
+  Device& d = it->second;
+  if (env.coordinatorEpoch != coordinatorEpoch_) return "rejected: stale coordinator epoch";
+  auto wb = workerBootRegistry_.find(env.workerId);
+  if (wb == workerBootRegistry_.end()) return "rejected: unregistered worker";
+  if (wb->second != env.workerBootId) return "rejected: stale worker boot id";
+  if (env.deviceGeneration.get() < d.generation.get()) return "rejected: stale device generation";
+  for (const auto& existing : d.faults.all()) {
+    if (existing.id == fault.id) return "rejected: duplicate fault id";
+  }
+  recordFaultLocked(d, fault);
+  reassessLocked(d);
+  return "accepted";
 }
 
 void HealthStore::recordValidation(const ValidationRecord& v) {
@@ -174,11 +202,50 @@ void HealthStore::recordValidation(const ValidationRecord& v) {
   auto it = devices_.find(v.accelerator);
   if (it == devices_.end()) return;
   Device& d = it->second;
-  d.validations.push_back(v);
-  if (v.passed && static_cast<int>(v.depth) > static_cast<int>(d.highestValidation)) {
-    d.highestValidation = v.depth;
-  }
+  addValidationLocked(d, v);
   reassessLocked(d);
+}
+
+std::string HealthStore::acceptValidation(const ValidationRecord& v, const AuthorityEnvelope& env) {
+  std::unique_lock lock(mu_);
+  auto it = devices_.find(v.accelerator);
+  if (it == devices_.end()) return "rejected: unknown device";
+  Device& d = it->second;
+  if (env.coordinatorEpoch != coordinatorEpoch_) return "rejected: stale coordinator epoch";
+  auto wb = workerBootRegistry_.find(env.workerId);
+  if (wb == workerBootRegistry_.end()) return "rejected: unregistered worker";
+  if (wb->second != env.workerBootId) return "rejected: stale worker boot id";
+  const auto vgKey = std::make_pair(env.workerId.get(), env.workerBootId.get());
+  auto vg = lastValidationGeneration_.find(vgKey);
+  if (vg != lastValidationGeneration_.end() && env.validationGeneration <= vg->second)
+    return "rejected: stale validation generation";
+  if (env.deviceGeneration.get() < d.generation.get()) return "rejected: stale device generation";
+  // A replayed run would also make the persisted state unloadable (duplicate id).
+  for (const auto& existing : d.validations) {
+    if (existing.id == v.id) return "rejected: duplicate validation run";
+  }
+  lastValidationGeneration_[vgKey] = env.validationGeneration;
+  addValidationLocked(d, v);
+  reassessLocked(d);
+  return "accepted";
+}
+
+void HealthStore::recordFaultLocked(Device& d, const Fault& fault) {
+  d.faults.record(fault);
+  faultIndex_[fault.type].insert(fault.accelerator);
+  globalFaults_.push_back(fault);
+}
+
+void HealthStore::addValidationLocked(Device& d, const ValidationRecord& v) {
+  d.validations.push_back(v);
+  if (!v.passed) return;
+  if (static_cast<int>(v.depth) > static_cast<int>(d.highestValidation)) d.highestValidation = v.depth;
+  // A passing validation of the required depth on the current device generation
+  // is the revalidation that a device-generation change requires.
+  if (v.deviceGeneration == d.generation &&
+      static_cast<int>(v.depth) >= static_cast<int>(policy_.requiredValidationDepth)) {
+    d.deviceGenerationChangedFlag = false;
+  }
 }
 
 // ---- Quarantine / recovery ----
@@ -244,8 +311,7 @@ DeviceSnapshot HealthStore::revalidate(AcceleratorId id, const ValidationRecord&
   auto it = devices_.find(id);
   if (it == devices_.end()) throw std::invalid_argument("revalidate: unknown device");
   Device& d = it->second;
-  d.validations.push_back(v);
-  if (v.passed && static_cast<int>(v.depth) > static_cast<int>(d.highestValidation)) d.highestValidation = v.depth;
+  addValidationLocked(d, v);
   if (d.inRecovery) {
     if (v.passed) {
       if (d.state == HealthState::RECOVERING && canTransition(d.state, HealthState::REVALIDATING)) {
@@ -262,6 +328,10 @@ DeviceSnapshot HealthStore::revalidate(AcceleratorId id, const ValidationRecord&
       // Failed validation during recovery is conservative: quarantine.
       if (d.state == HealthState::RECOVERING || d.state == HealthState::REVALIDATING) {
         applyTransitionLocked(d, HealthState::QUARANTINED, "revalidate-failed", "validation failed during recovery");
+        // The failed attempt ends this recovery; otherwise reassessment would
+        // resume it with its earlier successes still counted.
+        d.inRecovery = false;
+        if (d.recovery) d.recovery->end = clock_->now();
       }
     }
   }

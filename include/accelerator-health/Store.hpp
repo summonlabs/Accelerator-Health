@@ -165,6 +165,11 @@ class HealthStore {
 
   std::string acceptObservation(const AcceleratorObservation& obs, const AuthorityEnvelope& env);
   void recordFault(const Fault& fault);
+  // Distributed fault/validation reports, fenced like observations (coordinator
+  // epoch, current worker boot, device generation; validations also by
+  // validation generation and run id). Returns "accepted" or "rejected: ...".
+  std::string acceptFault(const Fault& fault, const AuthorityEnvelope& env);
+  std::string acceptValidation(const ValidationRecord& v, const AuthorityEnvelope& env);
 
   void recordValidation(const ValidationRecord& v);
   void beginQuarantine(AcceleratorId id, QuarantineAuthority authority, std::string reason, std::string triggeredBy);
@@ -199,7 +204,9 @@ class HealthStore {
   static bool loadFromFile(const std::string& path, HealthStore& out, std::string* error);
 
   void invalidateWorker(WorkerId worker, WorkerBootId boot, Timestamp now);
-  void registerWorker(WorkerId worker, WorkerBootId boot);
+  // Returns false (and changes nothing) for a boot id that a later incarnation
+  // of the same worker has superseded.
+  bool registerWorker(WorkerId worker, WorkerBootId boot);
   bool isWorkerCurrent(WorkerId worker, WorkerBootId boot) const;
 
   std::shared_ptr<Clock> clock() const { return clock_; }
@@ -244,6 +251,8 @@ class HealthStore {
   const Device* findLocked(AcceleratorId id) const;
   DeviceSnapshot makeSnapshotLocked(const Device& d) const;
   void reassessLocked(Device& d);
+  void recordFaultLocked(Device& d, const Fault& fault);
+  void addValidationLocked(Device& d, const ValidationRecord& v);
   void applyTransitionLocked(Device& d, HealthState to, std::string label, std::string detail);
   void applyTransition(Device& d, HealthState to, std::string label, std::string detail);
   void recordChangeLocked(Device& d, HealthState from, HealthState to, std::string label, std::string detail);
@@ -270,6 +279,11 @@ class HealthStore {
   // worker with a fresh boot id resumes at generation 1 while old reports from
   // a prior boot id are still rejected.
   std::map<std::pair<std::uint64_t, std::uint64_t>, ObservationGeneration> lastObservedGeneration_;
+  std::map<std::pair<std::uint64_t, std::uint64_t>, ValidationGeneration> lastValidationGeneration_;
+  // Worker incarnation history (persisted): the latest boot id registered by
+  // each worker and every (worker, boot) a later incarnation superseded.
+  std::map<WorkerId, WorkerBootId> workerLatestBoot_;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> retiredBoots_;
   std::map<AcceleratorId, Device> devices_;
   std::map<DeviceUuid, AcceleratorId> uuidIndex_;
   std::map<HealthState, std::set<AcceleratorId>> stateIndex_;

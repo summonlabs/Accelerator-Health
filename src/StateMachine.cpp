@@ -19,7 +19,6 @@ const std::vector<Transition>& legalTransitions() noexcept {
     {HealthState::UNKNOWN, HealthState::INITIALIZING, "init"},
     {HealthState::UNKNOWN, HealthState::OFFLINE, "offline"},
     {HealthState::UNKNOWN, HealthState::LOST, "lost"},
-    {HealthState::UNKNOWN, HealthState::HEALTHY, "first-validated"},
 
     {HealthState::INITIALIZING, HealthState::HEALTHY, "init-ok"},
     {HealthState::INITIALIZING, HealthState::DEGRADED, "init-degraded"},
